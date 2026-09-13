@@ -41,6 +41,10 @@ class UpstreamError(RuntimeError):
         self.status = status
 
 
+class TelegramAPIError(RuntimeError):
+    """Raised when Telegram rejects webhook configuration."""
+
+
 class NoRedirectHandler(HTTPRedirectHandler):
     """Prevent forwarding the webhook secret to a redirected host."""
 
@@ -84,6 +88,44 @@ class RelayConfig:
             raise ConfigurationError("RELAY_WEBHOOK_PATH must be an absolute path without a query")
 
 
+@dataclass(frozen=True)
+class WebhookSetupConfig:
+    enabled: bool
+    admin_token: str
+    bot_token: str
+    relay_public_url: str
+
+    @classmethod
+    def from_env(cls) -> "WebhookSetupConfig":
+        config = cls(
+            enabled=_env_bool("SETUP_ENDPOINT_ENABLED", False),
+            admin_token=os.environ.get("SETUP_ADMIN_TOKEN", "").strip(),
+            bot_token=os.environ.get("TELEGRAM_BOT_TOKEN", "").strip(),
+            relay_public_url=os.environ.get("RELAY_PUBLIC_URL", "").strip().rstrip("/"),
+        )
+        config.validate()
+        return config
+
+    def validate(self) -> None:
+        if not self.enabled:
+            return
+        if len(self.admin_token) < 32:
+            raise ConfigurationError("SETUP_ADMIN_TOKEN must contain at least 32 characters")
+        if ":" not in self.bot_token:
+            raise ConfigurationError("TELEGRAM_BOT_TOKEN is required")
+        parsed = urlsplit(self.relay_public_url)
+        if (
+            parsed.scheme != "https"
+            or not parsed.hostname
+            or parsed.username
+            or parsed.password
+            or parsed.path not in ("", "/")
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ConfigurationError("RELAY_PUBLIC_URL must be a complete HTTPS origin")
+
+
 def _env_int(name: str, default: int, *, minimum: int, maximum: int) -> int:
     raw = os.environ.get(name, str(default))
     try:
@@ -106,9 +148,23 @@ def _env_float(name: str, default: float, *, minimum: float, maximum: float) -> 
     return value
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name, str(default)).strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    raise ConfigurationError(f"{name} must be true or false")
+
+
 @lru_cache(maxsize=1)
 def get_config() -> RelayConfig:
     return RelayConfig.from_env()
+
+
+@lru_cache(maxsize=1)
+def get_setup_config() -> WebhookSetupConfig:
+    return WebhookSetupConfig.from_env()
 
 
 def parse_update(raw_body: bytes) -> dict[str, Any]:
@@ -169,6 +225,48 @@ def forward_update(
     return status
 
 
+def configure_telegram_webhook(
+    relay_config: RelayConfig,
+    setup_config: WebhookSetupConfig,
+    *,
+    opener: Callable[..., Any] | None = None,
+) -> str:
+    webhook_url = f"{setup_config.relay_public_url}{relay_config.webhook_path}"
+    body = json.dumps(
+        {
+            "url": webhook_url,
+            "secret_token": relay_config.webhook_secret,
+            "drop_pending_updates": False,
+        }
+    ).encode()
+    request = Request(
+        f"https://api.telegram.org/bot{setup_config.bot_token}/setWebhook",
+        data=body,
+        method="POST",
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+    )
+    open_request = opener or build_opener(
+        HTTPSHandler(context=ssl.create_default_context()), NoRedirectHandler()
+    ).open
+    try:
+        with open_request(request, timeout=15) as response:
+            response_body = response.read(16_384)
+            status = int(response.status)
+    except HTTPError as exc:
+        raise TelegramAPIError(f"Telegram rejected setup with HTTP {exc.code}") from exc
+    except (URLError, OSError, TimeoutError, socket.timeout) as exc:
+        raise TelegramAPIError("Telegram could not be reached") from exc
+    if not 200 <= status < 300:
+        raise TelegramAPIError(f"Telegram rejected setup with HTTP {status}")
+    try:
+        result = json.loads(response_body)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise TelegramAPIError("Telegram returned an invalid response") from exc
+    if not isinstance(result, dict) or result.get("ok") is not True:
+        raise TelegramAPIError("Telegram rejected webhook setup")
+    return webhook_url
+
+
 def json_response(
     start_response: Callable[..., Any], status: int, payload: dict[str, Any]
 ) -> Iterable[bytes]:
@@ -197,6 +295,31 @@ def application(environ: dict[str, Any], start_response: Callable[..., Any]) -> 
 
     if method == "GET" and path == "/healthz":
         return json_response(start_response, HTTPStatus.OK, {"ok": True})
+    if path == "/admin/setup-webhook":
+        if method != "POST":
+            return json_response(start_response, HTTPStatus.NOT_FOUND, {"ok": False})
+        try:
+            setup_config = get_setup_config()
+        except ConfigurationError as exc:
+            LOGGER.error("Invalid setup endpoint configuration: %s", exc)
+            return json_response(start_response, HTTPStatus.SERVICE_UNAVAILABLE, {"ok": False})
+        if not setup_config.enabled:
+            return json_response(start_response, HTTPStatus.NOT_FOUND, {"ok": False})
+        authorization = environ.get("HTTP_AUTHORIZATION", "")
+        expected_authorization = f"Bearer {setup_config.admin_token}"
+        if not secrets_match(authorization, expected_authorization):
+            return json_response(start_response, HTTPStatus.UNAUTHORIZED, {"ok": False})
+        try:
+            webhook_url = configure_telegram_webhook(config, setup_config)
+        except TelegramAPIError as exc:
+            LOGGER.warning("Webhook setup failed: %s", exc)
+            return json_response(start_response, HTTPStatus.BAD_GATEWAY, {"ok": False})
+        LOGGER.info("Telegram webhook configured for relay_host=%s", urlsplit(webhook_url).hostname)
+        return json_response(
+            start_response,
+            HTTPStatus.OK,
+            {"ok": True, "webhook_host": urlsplit(webhook_url).hostname},
+        )
     if method != "POST" or path != config.webhook_path:
         return json_response(start_response, HTTPStatus.NOT_FOUND, {"ok": False})
 

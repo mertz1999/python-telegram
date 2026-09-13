@@ -28,6 +28,10 @@ Configure these variables on the hosting platform:
 | `MAX_BODY_BYTES` | no | `1048576` |
 | `WEB_CONCURRENCY` | no | `2` |
 | `WEB_THREADS` | no | `4` |
+| `SETUP_ENDPOINT_ENABLED` | no | `false`; temporarily set to `true` to enable HTTP setup |
+| `SETUP_ADMIN_TOKEN` | for HTTP setup | A separate random value of at least 32 characters |
+| `TELEGRAM_BOT_TOKEN` | for HTTP setup | Token issued by Telegram `@BotFather` |
+| `RELAY_PUBLIC_URL` | for HTTP setup | Public HTTPS origin of this relay |
 
 The platform should run:
 
@@ -57,6 +61,24 @@ unset TELEGRAM_BOT_TOKEN TELEGRAM_WEBHOOK_SECRET RELAY_PUBLIC_URL
 ```
 
 Never commit the bot token, webhook secret, or a real `.env` file.
+
+### Protected HTTP setup endpoint
+
+As an alternative to `set_webhook.py`, temporarily configure
+`SETUP_ENDPOINT_ENABLED=true` and the three HTTP setup variables above. Then
+call the endpoint using its separate administrator token:
+
+```bash
+curl --request POST \
+  --header "Authorization: Bearer $SETUP_ADMIN_TOKEN" \
+  https://your-relay-domain.example/admin/setup-webhook
+```
+
+The endpoint reads the Telegram bot token and webhook secret only from the
+server environment. It does not accept or return either credential. It calls
+Telegram's `setWebhook`, preserves queued updates, and returns only the relay
+hostname. Set `SETUP_ENDPOINT_ENABLED=false` and remove `TELEGRAM_BOT_TOKEN`
+and `SETUP_ADMIN_TOKEN` from the relay environment after successful setup.
 
 ## Test
 
