@@ -1,3 +1,1 @@
-gunicorn<20.0.0; python_version < '3.5'
-gunicorn>=20.0.0; python_version >= '3.5'
-six
+gunicorn>=22.0.0,<24.0.0
