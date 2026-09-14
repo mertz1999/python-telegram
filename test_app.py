@@ -165,6 +165,62 @@ class RelayTests(unittest.TestCase):
         self.assertEqual(json.loads(body), {"ok": True})
         forward.assert_called_once()
 
+    def test_forward_telegram_api_preserves_json_payload(self) -> None:
+        raw_body = b'{"chat_id":"42","text":"hello"}'
+        captured = {}
+
+        def opener(request, **kwargs):
+            captured["request"] = request
+            captured["kwargs"] = kwargs
+            return FakeResponse(body=b'{"ok":true,"result":{"message_id":7}}')
+
+        status, payload = app.forward_telegram_api(
+            "sendMessage", raw_body, "123456:telegram-token", opener=opener
+        )
+
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(captured["request"].data, raw_body)
+        self.assertTrue(captured["request"].full_url.endswith("/sendMessage"))
+        self.assertEqual(captured["kwargs"]["timeout"], 15)
+
+    def test_wsgi_outbound_proxy_requires_secret_and_allows_known_method(self) -> None:
+        environment = {
+            "UPSTREAM_WEBHOOK_URL": self.config.upstream_url,
+            "TELEGRAM_WEBHOOK_SECRET": self.config.webhook_secret,
+            "TELEGRAM_BOT_TOKEN": "123456:telegram-token",
+        }
+        body = b'{"chat_id":"42","text":"hello"}'
+        with patch.dict(os.environ, environment, clear=False), patch.object(
+            app,
+            "forward_telegram_api",
+            return_value=(200, {"ok": True, "result": {"message_id": 7}}),
+        ) as forward:
+            app.get_config.cache_clear()
+            unauthorized_status, _ = call_app(
+                "POST", "/telegram/api/sendMessage", body=body
+            )
+            status, response = call_app(
+                "POST",
+                "/telegram/api/sendMessage",
+                body=body,
+                relay_secret=self.config.webhook_secret,
+            )
+            unsupported_status, _ = call_app(
+                "POST",
+                "/telegram/api/deleteWebhook",
+                body=b"{}",
+                relay_secret=self.config.webhook_secret,
+            )
+
+        self.assertEqual(unauthorized_status, "401 Unauthorized")
+        self.assertEqual(status, "200 OK")
+        self.assertTrue(json.loads(response)["ok"])
+        self.assertEqual(unsupported_status, "404 Not Found")
+        forward.assert_called_once_with(
+            "sendMessage", body, environment["TELEGRAM_BOT_TOKEN"]
+        )
+
     def test_setup_endpoint_is_disabled_by_default(self) -> None:
         environment = {
             "UPSTREAM_WEBHOOK_URL": self.config.upstream_url,
@@ -281,6 +337,7 @@ def call_app(
     *,
     body: bytes = b"",
     secret: str = "",
+    relay_secret: str = "",
     authorization: str = "",
 ):
     captured = {}
@@ -297,6 +354,8 @@ def call_app(
     }
     if secret:
         environ["HTTP_X_TELEGRAM_BOT_API_SECRET_TOKEN"] = secret
+    if relay_secret:
+        environ["HTTP_X_AGENTFA_RELAY_SECRET"] = relay_secret
     if authorization:
         environ["HTTP_AUTHORIZATION"] = authorization
     response_body = b"".join(app.application(environ, start_response))

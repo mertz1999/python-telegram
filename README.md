@@ -11,6 +11,15 @@ Telegram
   -> AgentFA bot handler
 ```
 
+AgentFA also sends Telegram Bot API calls back through the relay because its
+PaaSta runtime cannot reach `api.telegram.org` directly:
+
+```text
+AgentFA
+  -> https://your-relay-domain.example/telegram/api/<allowed-method>
+  -> Telegram Bot API
+```
+
 It is intentionally not a general-purpose proxy. The upstream is one fixed
 HTTPS URL, redirects are rejected, request bodies are size-limited, and message
 bodies and secrets are never logged.
@@ -30,7 +39,7 @@ Configure these variables on the hosting platform:
 | `WEB_THREADS` | no | `4` |
 | `SETUP_ENDPOINT_ENABLED` | no | `false`; temporarily set to `true` to enable HTTP setup |
 | `SETUP_ADMIN_TOKEN` | for HTTP setup | A separate random value of at least 32 characters |
-| `TELEGRAM_BOT_TOKEN` | for HTTP setup | Token issued by Telegram `@BotFather` |
+| `TELEGRAM_BOT_TOKEN` | yes | Token issued by Telegram `@BotFather`; used for setup, diagnostics, and outbound Bot API forwarding |
 | `RELAY_PUBLIC_URL` | for HTTP setup | Public HTTPS origin of this relay |
 
 The platform should run:
@@ -61,6 +70,12 @@ unset TELEGRAM_BOT_TOKEN TELEGRAM_WEBHOOK_SECRET RELAY_PUBLIC_URL
 ```
 
 Never commit the bot token, webhook secret, or a real `.env` file.
+
+Configure AgentFA on PaaSta with
+`MESSENGER_TELEGRAM_API_BASE_URL=https://your-relay-domain.example/telegram/api`
+and the same `MESSENGER_TELEGRAM_WEBHOOK_SECRET` used by the relay. The outbound
+endpoint accepts only the Bot API methods AgentFA needs and rejects requests
+without the shared secret.
 
 ### Protected HTTP setup endpoint
 

@@ -23,6 +23,14 @@ from gunicorn.app.base import BaseApplication
 
 LOGGER = logging.getLogger("agentfa.telegram_relay")
 SECRET_HEADER = "X-Telegram-Bot-Api-Secret-Token"
+OUTBOUND_PATH_PREFIX = "/telegram/api/"
+OUTBOUND_METHODS = {
+    "answerCallbackQuery",
+    "sendMediaGroup",
+    "sendMessage",
+    "sendPhoto",
+    "setMyCommands",
+}
 DEFAULT_MAX_BODY_BYTES = 1_048_576
 
 
@@ -303,6 +311,40 @@ def get_telegram_webhook_info(
     return result
 
 
+def forward_telegram_api(
+    method: str,
+    raw_body: bytes,
+    bot_token: str,
+    *,
+    opener: Callable[..., Any] | None = None,
+) -> tuple[int, dict[str, Any]]:
+    request = Request(
+        f"https://api.telegram.org/bot{bot_token}/{method}",
+        data=raw_body,
+        method="POST",
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+    )
+    open_request = opener or build_opener(
+        HTTPSHandler(context=ssl.create_default_context()), NoRedirectHandler()
+    ).open
+    try:
+        with open_request(request, timeout=15) as response:
+            response_body = response.read(65_536)
+            status = int(response.status)
+    except HTTPError as exc:
+        response_body = exc.read(65_536)
+        status = int(exc.code)
+    except (URLError, OSError, TimeoutError, socket.timeout) as exc:
+        raise TelegramAPIError("Telegram could not be reached") from exc
+    try:
+        payload = json.loads(response_body)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise TelegramAPIError("Telegram returned an invalid response") from exc
+    if not isinstance(payload, dict):
+        raise TelegramAPIError("Telegram returned an invalid response")
+    return status, payload
+
+
 def check_agentfa_connection(config: RelayConfig) -> dict[str, Any]:
     update_id = 2_000_000_000 + (int(time.time()) % 100_000_000)
     raw_body = json.dumps({"update_id": update_id}, separators=(",", ":")).encode()
@@ -388,6 +430,43 @@ def application(environ: dict[str, Any], start_response: Callable[..., Any]) -> 
 
     if method == "GET" and path == "/healthz":
         return json_response(start_response, HTTPStatus.OK, {"ok": True})
+    if method == "POST" and path.startswith(OUTBOUND_PATH_PREFIX):
+        supplied_secret = environ.get("HTTP_X_AGENTFA_RELAY_SECRET", "")
+        if not secrets_match(supplied_secret, config.webhook_secret):
+            return json_response(start_response, HTTPStatus.UNAUTHORIZED, {"ok": False})
+        telegram_method = path.removeprefix(OUTBOUND_PATH_PREFIX)
+        if telegram_method not in OUTBOUND_METHODS:
+            return json_response(start_response, HTTPStatus.NOT_FOUND, {"ok": False})
+        bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+        if ":" not in bot_token:
+            return json_response(start_response, HTTPStatus.SERVICE_UNAVAILABLE, {"ok": False})
+        try:
+            content_length = int(environ.get("CONTENT_LENGTH", ""))
+        except (TypeError, ValueError):
+            return json_response(start_response, HTTPStatus.LENGTH_REQUIRED, {"ok": False})
+        if content_length <= 0 or content_length > config.max_body_bytes:
+            return json_response(
+                start_response, HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"ok": False}
+            )
+        raw_body = environ["wsgi.input"].read(content_length)
+        try:
+            payload = json.loads(raw_body)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return json_response(
+                start_response, HTTPStatus.UNPROCESSABLE_ENTITY, {"ok": False}
+            )
+        if not isinstance(payload, dict):
+            return json_response(
+                start_response, HTTPStatus.UNPROCESSABLE_ENTITY, {"ok": False}
+            )
+        try:
+            status, response_payload = forward_telegram_api(
+                telegram_method, raw_body, bot_token
+            )
+        except TelegramAPIError:
+            LOGGER.warning("Telegram outbound proxy failed for method=%s", telegram_method)
+            return json_response(start_response, HTTPStatus.BAD_GATEWAY, {"ok": False})
+        return json_response(start_response, status, response_payload)
     if path in {"/admin/setup-webhook", "/admin/test-connections"}:
         if method != "POST":
             return json_response(start_response, HTTPStatus.NOT_FOUND, {"ok": False})
