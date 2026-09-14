@@ -11,8 +11,9 @@ import app
 
 
 class FakeResponse:
-    def __init__(self, status: int = 200) -> None:
+    def __init__(self, status: int = 200, body: bytes = b'{"ok":true}') -> None:
         self.status = status
+        self.body = body
 
     def __enter__(self):
         return self
@@ -21,7 +22,7 @@ class FakeResponse:
         return None
 
     def read(self, _limit: int) -> bytes:
-        return b'{"ok":true}'
+        return self.body
 
 
 class RelayTests(unittest.TestCase):
@@ -99,6 +100,35 @@ class RelayTests(unittest.TestCase):
         self.assertFalse(request_body["drop_pending_updates"])
         self.assertEqual(captured["kwargs"]["timeout"], 15)
 
+    def test_telegram_diagnostics_returns_webhook_info(self) -> None:
+        setup_config = app.WebhookSetupConfig(
+            enabled=True,
+            admin_token="a" * 32,
+            bot_token="123456:telegram-token-value",
+            relay_public_url="https://relay.example.com",
+        )
+        captured = {}
+
+        def opener(request, **kwargs):
+            captured["request"] = request
+            captured["kwargs"] = kwargs
+            return FakeResponse(
+                body=json.dumps(
+                    {
+                        "ok": True,
+                        "result": {
+                            "url": "https://relay.example.com/telegram/webhook",
+                            "pending_update_count": 0,
+                        },
+                    }
+                ).encode()
+            )
+
+        result = app.get_telegram_webhook_info(setup_config, opener=opener)
+        self.assertEqual(result["pending_update_count"], 0)
+        self.assertTrue(captured["request"].full_url.endswith("/getWebhookInfo"))
+        self.assertEqual(captured["kwargs"]["timeout"], 15)
+
     def test_wsgi_health_and_authorization(self) -> None:
         environment = {
             "UPSTREAM_WEBHOOK_URL": self.config.upstream_url,
@@ -147,6 +177,18 @@ class RelayTests(unittest.TestCase):
             status, _ = call_app("POST", "/admin/setup-webhook")
         self.assertEqual(status, "404 Not Found")
 
+    def test_diagnostics_endpoint_is_disabled_by_default(self) -> None:
+        environment = {
+            "UPSTREAM_WEBHOOK_URL": self.config.upstream_url,
+            "TELEGRAM_WEBHOOK_SECRET": self.config.webhook_secret,
+            "SETUP_ENDPOINT_ENABLED": "false",
+        }
+        with patch.dict(os.environ, environment, clear=False):
+            app.get_config.cache_clear()
+            app.get_setup_config.cache_clear()
+            status, _ = call_app("POST", "/admin/test-connections")
+        self.assertEqual(status, "404 Not Found")
+
     def test_setup_endpoint_requires_separate_admin_token(self) -> None:
         environment = setup_environment(self.config)
         with patch.dict(os.environ, environment, clear=False):
@@ -174,6 +216,52 @@ class RelayTests(unittest.TestCase):
         self.assertNotIn(self.config.webhook_secret, body.decode())
         self.assertNotIn(environment["TELEGRAM_BOT_TOKEN"], body.decode())
         configure.assert_called_once()
+
+    def test_diagnostics_endpoint_requires_admin_token(self) -> None:
+        environment = setup_environment(self.config)
+        with patch.dict(os.environ, environment, clear=False):
+            app.get_config.cache_clear()
+            app.get_setup_config.cache_clear()
+            status, _ = call_app("POST", "/admin/test-connections")
+        self.assertEqual(status, "401 Unauthorized")
+
+    def test_diagnostics_endpoint_reports_both_connections_safely(self) -> None:
+        environment = setup_environment(self.config)
+        telegram_result = {
+            "ok": True,
+            "latency_ms": 20,
+            "webhook_configured": True,
+            "webhook_matches_relay": True,
+            "webhook_host": "relay.example.com",
+            "pending_update_count": 0,
+            "last_error_date": None,
+            "last_error_message": None,
+        }
+        agentfa_result = {
+            "ok": True,
+            "status": 200,
+            "latency_ms": 30,
+            "upstream_host": "agentfaai.ir",
+        }
+        with (
+            patch.dict(os.environ, environment, clear=False),
+            patch.object(app, "check_telegram_connection", return_value=telegram_result),
+            patch.object(app, "check_agentfa_connection", return_value=agentfa_result),
+        ):
+            app.get_config.cache_clear()
+            app.get_setup_config.cache_clear()
+            status, body = call_app(
+                "POST",
+                "/admin/test-connections",
+                authorization=f"Bearer {environment['SETUP_ADMIN_TOKEN']}",
+            )
+        response = json.loads(body)
+        self.assertEqual(status, "200 OK")
+        self.assertTrue(response["ok"])
+        self.assertEqual(response["connections"]["telegram"], telegram_result)
+        self.assertEqual(response["connections"]["agentfa"], agentfa_result)
+        self.assertNotIn(self.config.webhook_secret, body.decode())
+        self.assertNotIn(environment["TELEGRAM_BOT_TOKEN"], body.decode())
 
 
 def setup_environment(config: app.RelayConfig) -> dict[str, str]:

@@ -9,6 +9,7 @@ import logging
 import os
 import socket
 import ssl
+import time
 from dataclasses import dataclass
 from functools import lru_cache
 from http import HTTPStatus
@@ -267,6 +268,98 @@ def configure_telegram_webhook(
     return webhook_url
 
 
+def get_telegram_webhook_info(
+    setup_config: WebhookSetupConfig,
+    *,
+    opener: Callable[..., Any] | None = None,
+) -> dict[str, Any]:
+    request = Request(
+        f"https://api.telegram.org/bot{setup_config.bot_token}/getWebhookInfo",
+        method="GET",
+        headers={"Accept": "application/json"},
+    )
+    open_request = opener or build_opener(
+        HTTPSHandler(context=ssl.create_default_context()), NoRedirectHandler()
+    ).open
+    try:
+        with open_request(request, timeout=15) as response:
+            response_body = response.read(16_384)
+            status = int(response.status)
+    except HTTPError as exc:
+        raise TelegramAPIError(f"Telegram rejected diagnostics with HTTP {exc.code}") from exc
+    except (URLError, OSError, TimeoutError, socket.timeout) as exc:
+        raise TelegramAPIError("Telegram could not be reached") from exc
+    if not 200 <= status < 300:
+        raise TelegramAPIError(f"Telegram rejected diagnostics with HTTP {status}")
+    try:
+        payload = json.loads(response_body)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise TelegramAPIError("Telegram returned an invalid response") from exc
+    if not isinstance(payload, dict):
+        raise TelegramAPIError("Telegram returned an invalid response")
+    result = payload.get("result")
+    if payload.get("ok") is not True or not isinstance(result, dict):
+        raise TelegramAPIError("Telegram rejected diagnostics")
+    return result
+
+
+def check_agentfa_connection(config: RelayConfig) -> dict[str, Any]:
+    update_id = 2_000_000_000 + (int(time.time()) % 100_000_000)
+    raw_body = json.dumps({"update_id": update_id}, separators=(",", ":")).encode()
+    started = time.monotonic()
+    try:
+        upstream_status = forward_update(raw_body, config)
+    except UpstreamError as exc:
+        latency_ms = round((time.monotonic() - started) * 1000)
+        error = (
+            "timeout"
+            if exc.status == HTTPStatus.GATEWAY_TIMEOUT
+            else "unreachable_or_rejected"
+        )
+        return {
+            "ok": False,
+            "latency_ms": latency_ms,
+            "error": error,
+        }
+    return {
+        "ok": True,
+        "status": upstream_status,
+        "latency_ms": round((time.monotonic() - started) * 1000),
+        "upstream_host": urlsplit(config.upstream_url).hostname,
+    }
+
+
+def check_telegram_connection(
+    config: RelayConfig,
+    setup_config: WebhookSetupConfig,
+) -> dict[str, Any]:
+    started = time.monotonic()
+    try:
+        webhook_info = get_telegram_webhook_info(setup_config)
+    except TelegramAPIError:
+        return {
+            "ok": False,
+            "latency_ms": round((time.monotonic() - started) * 1000),
+            "error": "unreachable_or_rejected",
+        }
+
+    webhook_url = webhook_info.get("url")
+    if not isinstance(webhook_url, str):
+        webhook_url = ""
+    expected_url = f"{setup_config.relay_public_url}{config.webhook_path}"
+    webhook_matches_relay = bool(webhook_url) and secrets_match(webhook_url, expected_url)
+    return {
+        "ok": True,
+        "latency_ms": round((time.monotonic() - started) * 1000),
+        "webhook_configured": bool(webhook_url),
+        "webhook_matches_relay": webhook_matches_relay,
+        "webhook_host": urlsplit(webhook_url).hostname if webhook_url else None,
+        "pending_update_count": webhook_info.get("pending_update_count"),
+        "last_error_date": webhook_info.get("last_error_date"),
+        "last_error_message": webhook_info.get("last_error_message"),
+    }
+
+
 def json_response(
     start_response: Callable[..., Any], status: int, payload: dict[str, Any]
 ) -> Iterable[bytes]:
@@ -295,7 +388,7 @@ def application(environ: dict[str, Any], start_response: Callable[..., Any]) -> 
 
     if method == "GET" and path == "/healthz":
         return json_response(start_response, HTTPStatus.OK, {"ok": True})
-    if path == "/admin/setup-webhook":
+    if path in {"/admin/setup-webhook", "/admin/test-connections"}:
         if method != "POST":
             return json_response(start_response, HTTPStatus.NOT_FOUND, {"ok": False})
         try:
@@ -309,6 +402,25 @@ def application(environ: dict[str, Any], start_response: Callable[..., Any]) -> 
         expected_authorization = f"Bearer {setup_config.admin_token}"
         if not secrets_match(authorization, expected_authorization):
             return json_response(start_response, HTTPStatus.UNAUTHORIZED, {"ok": False})
+        if path == "/admin/test-connections":
+            telegram = check_telegram_connection(config, setup_config)
+            agentfa = check_agentfa_connection(config)
+            connections_ok = bool(
+                telegram.get("ok")
+                and telegram.get("webhook_matches_relay")
+                and agentfa.get("ok")
+            )
+            return json_response(
+                start_response,
+                HTTPStatus.OK,
+                {
+                    "ok": connections_ok,
+                    "connections": {
+                        "telegram": telegram,
+                        "agentfa": agentfa,
+                    },
+                },
+            )
         try:
             webhook_url = configure_telegram_webhook(config, setup_config)
         except TelegramAPIError as exc:
