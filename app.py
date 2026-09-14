@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import hmac
 import json
 import logging
@@ -23,6 +24,8 @@ from gunicorn.app.base import BaseApplication
 
 LOGGER = logging.getLogger("agentfa.telegram_relay")
 SECRET_HEADER = "X-Telegram-Bot-Api-Secret-Token"
+RELAY_AUTH_HEADER = "X-AgentFA-Relay-Auth"
+RELAY_AUTH_CONTEXT = b"agentfa-telegram-relay-auth-v1"
 OUTBOUND_PATH_PREFIX = "/telegram/api/"
 OUTBOUND_METHODS = {
     "answerCallbackQuery",
@@ -65,6 +68,7 @@ class NoRedirectHandler(HTTPRedirectHandler):
 class RelayConfig:
     upstream_url: str
     webhook_secret: str
+    bot_token: str = ""
     webhook_path: str = "/telegram/webhook"
     forward_timeout_seconds: float = 7.0
     max_body_bytes: int = DEFAULT_MAX_BODY_BYTES
@@ -74,6 +78,7 @@ class RelayConfig:
         config = cls(
             upstream_url=os.environ.get("UPSTREAM_WEBHOOK_URL", "").strip(),
             webhook_secret=os.environ.get("TELEGRAM_WEBHOOK_SECRET", "").strip(),
+            bot_token=os.environ.get("TELEGRAM_BOT_TOKEN", "").strip(),
             webhook_path=os.environ.get("RELAY_WEBHOOK_PATH", "/telegram/webhook").strip(),
             forward_timeout_seconds=_env_float(
                 "FORWARD_TIMEOUT_SECONDS", 7.0, minimum=0.5, maximum=20.0
@@ -190,22 +195,34 @@ def secrets_match(provided: str, expected: str) -> bool:
     return bool(provided) and hmac.compare_digest(provided.encode(), expected.encode())
 
 
+def derive_relay_auth(bot_token: str) -> str:
+    """Derive a relay-only credential without transmitting the bot token."""
+    token = bot_token.strip()
+    if not token:
+        return ""
+    return hmac.new(token.encode(), RELAY_AUTH_CONTEXT, hashlib.sha256).hexdigest()
+
+
 def forward_update(
     raw_body: bytes,
     config: RelayConfig,
     *,
     opener: Callable[..., Any] | None = None,
 ) -> int:
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        SECRET_HEADER: config.webhook_secret,
+        "User-Agent": "AgentFA-Telegram-Relay/1.0",
+    }
+    relay_auth = derive_relay_auth(config.bot_token)
+    if relay_auth:
+        headers[RELAY_AUTH_HEADER] = relay_auth
     request = Request(
         config.upstream_url,
         data=raw_body,
         method="POST",
-        headers={
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            SECRET_HEADER: config.webhook_secret,
-            "User-Agent": "AgentFA-Telegram-Relay/1.0",
-        },
+        headers=headers,
     )
     open_request = opener or build_opener(
         HTTPSHandler(context=ssl.create_default_context()), NoRedirectHandler()
@@ -431,15 +448,19 @@ def application(environ: dict[str, Any], start_response: Callable[..., Any]) -> 
     if method == "GET" and path == "/healthz":
         return json_response(start_response, HTTPStatus.OK, {"ok": True})
     if method == "POST" and path.startswith(OUTBOUND_PATH_PREFIX):
+        bot_token = config.bot_token
+        if ":" not in bot_token:
+            return json_response(start_response, HTTPStatus.SERVICE_UNAVAILABLE, {"ok": False})
         supplied_secret = environ.get("HTTP_X_AGENTFA_RELAY_SECRET", "")
-        if not secrets_match(supplied_secret, config.webhook_secret):
+        supplied_relay_auth = environ.get("HTTP_X_AGENTFA_RELAY_AUTH", "")
+        if not (
+            secrets_match(supplied_secret, config.webhook_secret)
+            or secrets_match(supplied_relay_auth, derive_relay_auth(bot_token))
+        ):
             return json_response(start_response, HTTPStatus.UNAUTHORIZED, {"ok": False})
         telegram_method = path.removeprefix(OUTBOUND_PATH_PREFIX)
         if telegram_method not in OUTBOUND_METHODS:
             return json_response(start_response, HTTPStatus.NOT_FOUND, {"ok": False})
-        bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-        if ":" not in bot_token:
-            return json_response(start_response, HTTPStatus.SERVICE_UNAVAILABLE, {"ok": False})
         try:
             content_length = int(environ.get("CONTENT_LENGTH", ""))
         except (TypeError, ValueError):

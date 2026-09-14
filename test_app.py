@@ -30,6 +30,7 @@ class RelayTests(unittest.TestCase):
         self.config = app.RelayConfig(
             upstream_url="https://agentfaai.ir/api/bots/telegram/webhook",
             webhook_secret="test_secret-123",
+            bot_token="123456:telegram-token",
         )
 
     def tearDown(self) -> None:
@@ -67,6 +68,10 @@ class RelayTests(unittest.TestCase):
         request = captured["request"]
         self.assertEqual(request.data, raw_body)
         self.assertEqual(request.get_header("X-telegram-bot-api-secret-token"), "test_secret-123")
+        self.assertEqual(
+            request.get_header("X-agentfa-relay-auth"),
+            app.derive_relay_auth(self.config.bot_token),
+        )
         self.assertEqual(captured["kwargs"]["timeout"], 7.0)
 
     def test_upstream_http_error_becomes_retryable_error(self) -> None:
@@ -206,6 +211,12 @@ class RelayTests(unittest.TestCase):
                 body=body,
                 relay_secret=self.config.webhook_secret,
             )
+            derived_status, _ = call_app(
+                "POST",
+                "/telegram/api/sendMessage",
+                body=body,
+                relay_auth=app.derive_relay_auth(environment["TELEGRAM_BOT_TOKEN"]),
+            )
             unsupported_status, _ = call_app(
                 "POST",
                 "/telegram/api/deleteWebhook",
@@ -216,10 +227,10 @@ class RelayTests(unittest.TestCase):
         self.assertEqual(unauthorized_status, "401 Unauthorized")
         self.assertEqual(status, "200 OK")
         self.assertTrue(json.loads(response)["ok"])
+        self.assertEqual(derived_status, "200 OK")
         self.assertEqual(unsupported_status, "404 Not Found")
-        forward.assert_called_once_with(
-            "sendMessage", body, environment["TELEGRAM_BOT_TOKEN"]
-        )
+        self.assertEqual(forward.call_count, 2)
+        forward.assert_called_with("sendMessage", body, environment["TELEGRAM_BOT_TOKEN"])
 
     def test_setup_endpoint_is_disabled_by_default(self) -> None:
         environment = {
@@ -338,6 +349,7 @@ def call_app(
     body: bytes = b"",
     secret: str = "",
     relay_secret: str = "",
+    relay_auth: str = "",
     authorization: str = "",
 ):
     captured = {}
@@ -356,6 +368,8 @@ def call_app(
         environ["HTTP_X_TELEGRAM_BOT_API_SECRET_TOKEN"] = secret
     if relay_secret:
         environ["HTTP_X_AGENTFA_RELAY_SECRET"] = relay_secret
+    if relay_auth:
+        environ["HTTP_X_AGENTFA_RELAY_AUTH"] = relay_auth
     if authorization:
         environ["HTTP_AUTHORIZATION"] = authorization
     response_body = b"".join(app.application(environ, start_response))
