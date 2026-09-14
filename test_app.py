@@ -81,7 +81,7 @@ class RelayTests(unittest.TestCase):
         with self.assertRaisesRegex(app.UpstreamError, "HTTP 401"):
             app.forward_update(b'{"update_id":42}', self.config, opener=opener)
 
-    def test_configure_webhook_uses_relay_url_and_shared_secret(self) -> None:
+    def test_configure_webhook_uses_relay_url_and_derived_secret(self) -> None:
         setup_config = app.WebhookSetupConfig(
             enabled=True,
             admin_token="a" * 32,
@@ -101,7 +101,10 @@ class RelayTests(unittest.TestCase):
         request_body = json.loads(captured["request"].data)
         self.assertEqual(webhook_url, "https://relay.example.com/telegram/webhook")
         self.assertEqual(request_body["url"], webhook_url)
-        self.assertEqual(request_body["secret_token"], self.config.webhook_secret)
+        self.assertEqual(
+            request_body["secret_token"],
+            app.derive_webhook_auth(setup_config.bot_token),
+        )
         self.assertFalse(request_body["drop_pending_updates"])
         self.assertEqual(captured["kwargs"]["timeout"], 15)
 
@@ -164,6 +167,27 @@ class RelayTests(unittest.TestCase):
                 "/telegram/webhook",
                 body=b'{"update_id":42}',
                 secret=self.config.webhook_secret,
+            )
+        app.get_config.cache_clear()
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(json.loads(body), {"ok": True})
+        forward.assert_called_once()
+
+    def test_wsgi_accepts_derived_webhook_auth(self) -> None:
+        environment = {
+            "UPSTREAM_WEBHOOK_URL": self.config.upstream_url,
+            "TELEGRAM_WEBHOOK_SECRET": "different-legacy-secret",
+            "TELEGRAM_BOT_TOKEN": self.config.bot_token,
+        }
+        with patch.dict(os.environ, environment, clear=False), patch.object(
+            app, "forward_update", return_value=200
+        ) as forward:
+            app.get_config.cache_clear()
+            status, body = call_app(
+                "POST",
+                "/telegram/webhook",
+                body=b'{"update_id":43}',
+                secret=app.derive_webhook_auth(self.config.bot_token),
             )
         app.get_config.cache_clear()
         self.assertEqual(status, "200 OK")

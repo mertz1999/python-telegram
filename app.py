@@ -26,6 +26,7 @@ LOGGER = logging.getLogger("agentfa.telegram_relay")
 SECRET_HEADER = "X-Telegram-Bot-Api-Secret-Token"
 RELAY_AUTH_HEADER = "X-AgentFA-Relay-Auth"
 RELAY_AUTH_CONTEXT = b"agentfa-telegram-relay-auth-v1"
+WEBHOOK_AUTH_CONTEXT = b"agentfa-telegram-webhook-auth-v1"
 OUTBOUND_PATH_PREFIX = "/telegram/api/"
 OUTBOUND_METHODS = {
     "answerCallbackQuery",
@@ -203,6 +204,14 @@ def derive_relay_auth(bot_token: str) -> str:
     return hmac.new(token.encode(), RELAY_AUTH_CONTEXT, hashlib.sha256).hexdigest()
 
 
+def derive_webhook_auth(bot_token: str) -> str:
+    """Derive a Telegram-compatible secret used only for webhook ingress."""
+    token = bot_token.strip()
+    if not token:
+        return ""
+    return hmac.new(token.encode(), WEBHOOK_AUTH_CONTEXT, hashlib.sha256).hexdigest()
+
+
 def forward_update(
     raw_body: bytes,
     config: RelayConfig,
@@ -261,7 +270,7 @@ def configure_telegram_webhook(
     body = json.dumps(
         {
             "url": webhook_url,
-            "secret_token": relay_config.webhook_secret,
+            "secret_token": derive_webhook_auth(setup_config.bot_token),
             "drop_pending_updates": False,
         }
     ).encode()
@@ -536,7 +545,10 @@ def application(environ: dict[str, Any], start_response: Callable[..., Any]) -> 
         return json_response(start_response, HTTPStatus.NOT_FOUND, {"ok": False})
 
     supplied_secret = environ.get("HTTP_X_TELEGRAM_BOT_API_SECRET_TOKEN", "")
-    if not secrets_match(supplied_secret, config.webhook_secret):
+    if not (
+        secrets_match(supplied_secret, config.webhook_secret)
+        or secrets_match(supplied_secret, derive_webhook_auth(config.bot_token))
+    ):
         return json_response(start_response, HTTPStatus.UNAUTHORIZED, {"ok": False})
 
     try:

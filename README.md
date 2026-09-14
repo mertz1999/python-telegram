@@ -31,7 +31,7 @@ Configure these variables on the hosting platform:
 | Variable | Required | Value |
 | --- | --- | --- |
 | `UPSTREAM_WEBHOOK_URL` | yes | `https://agentfaai.ir/api/bots/telegram/webhook` |
-| `TELEGRAM_WEBHOOK_SECRET` | yes | Secret Telegram uses when calling this relay; matching AgentFA remains supported for backward compatibility |
+| `TELEGRAM_WEBHOOK_SECRET` | yes | Legacy webhook secret retained for backward compatibility; setup now registers a derived Telegram-compatible secret |
 | `RELAY_WEBHOOK_PATH` | no | `/telegram/webhook` |
 | `FORWARD_TIMEOUT_SECONDS` | no | `7` |
 | `MAX_BODY_BYTES` | no | `1048576` |
@@ -73,11 +73,12 @@ Never commit the bot token, webhook secret, or a real `.env` file.
 
 Configure AgentFA on PaaSta with
 `MESSENGER_TELEGRAM_API_BASE_URL=https://your-relay-domain.example/telegram/api`.
-Both services must use the same Telegram bot token. They derive a relay-only
-authentication value from it, so `TELEGRAM_WEBHOOK_SECRET` does not also need to
-be synchronized with AgentFA. The previous shared-secret header remains accepted
-for backward compatibility. The outbound endpoint accepts only the Bot API
-methods AgentFA needs and rejects unauthenticated requests.
+Both services must use the same Telegram bot token. They derive separate values
+for relay authentication and Telegram webhook verification, so
+`TELEGRAM_WEBHOOK_SECRET` does not also need to be synchronized with AgentFA.
+The previous shared-secret headers remain accepted for backward compatibility.
+The outbound endpoint accepts only the Bot API methods AgentFA needs and rejects
+unauthenticated requests.
 
 ### Protected HTTP setup endpoint
 
