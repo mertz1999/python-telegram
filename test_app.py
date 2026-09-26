@@ -36,6 +36,7 @@ class RelayTests(unittest.TestCase):
     def tearDown(self) -> None:
         app.get_config.cache_clear()
         app.get_setup_config.cache_clear()
+        app.get_gemini_config.cache_clear()
 
     def test_config_rejects_non_https_upstream(self) -> None:
         with self.assertRaisesRegex(ValueError, "HTTPS"):
@@ -213,6 +214,120 @@ class RelayTests(unittest.TestCase):
         self.assertTrue(captured["request"].full_url.endswith("/sendMessage"))
         self.assertEqual(captured["kwargs"]["timeout"], 15)
 
+    def test_gemini_relay_requires_keys_when_enabled(self) -> None:
+        with self.assertRaisesRegex(ValueError, "GEMINI_RELAY_API_KEYS"):
+            app.GeminiRelayConfig(
+                enabled=True,
+                api_keys=(),
+                allowed_models=("gemini-3.5-flash-lite",),
+            ).validate()
+
+    def test_gemini_path_is_limited_to_allowlisted_generate_content(self) -> None:
+        config = gemini_config()
+        self.assertEqual(
+            app.parse_gemini_path(
+                "/gemini/v1beta/models/gemini-3.5-flash-lite:generateContent",
+                config,
+            ),
+            ("v1beta", "gemini-3.5-flash-lite", "generateContent"),
+        )
+        self.assertIsNone(
+            app.parse_gemini_path(
+                "/gemini/v1beta/models/unapproved-model:generateContent",
+                config,
+            )
+        )
+        self.assertIsNone(
+            app.parse_gemini_path(
+                "/gemini/v1beta/models/gemini-3.5-flash-lite:deleteModel",
+                config,
+            )
+        )
+
+    def test_forward_gemini_api_uses_fixed_google_origin_and_preserves_body(self) -> None:
+        body = b'{"contents":[{"parts":[{"text":"hello"}]}]}'
+        captured = {}
+
+        def opener(request, **kwargs):
+            captured["request"] = request
+            captured["kwargs"] = kwargs
+            return FakeResponse(body=b'{"candidates":[]}')
+
+        status, response, content_type = app.forward_gemini_api(
+            version="v1beta",
+            model="gemini-3.5-flash-lite",
+            action="generateContent",
+            raw_body=body,
+            api_key="test-gemini-key-one",
+            config=gemini_config(),
+            opener=opener,
+        )
+
+        request = captured["request"]
+        self.assertEqual(status, 200)
+        self.assertEqual(response, b'{"candidates":[]}')
+        self.assertEqual(content_type, "application/json")
+        self.assertEqual(request.data, body)
+        self.assertEqual(
+            request.full_url,
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            "gemini-3.5-flash-lite:generateContent",
+        )
+        self.assertEqual(request.get_header("X-goog-api-key"), "test-gemini-key-one")
+        self.assertEqual(captured["kwargs"]["timeout"], 125.0)
+
+    def test_wsgi_gemini_relay_requires_allowlisted_key_and_model(self) -> None:
+        environment = {
+            "UPSTREAM_WEBHOOK_URL": self.config.upstream_url,
+            "TELEGRAM_WEBHOOK_SECRET": self.config.webhook_secret,
+            "GEMINI_RELAY_ENABLED": "true",
+            "GEMINI_RELAY_API_KEYS": '["test-gemini-key-one","test-gemini-key-two"]',
+            "GEMINI_ALLOWED_MODELS": "gemini-3.5-flash-lite",
+        }
+        path = "/gemini/v1beta/models/gemini-3.5-flash-lite:generateContent"
+        body = b'{"contents":[{"parts":[{"text":"hello"}]}]}'
+        with patch.dict(os.environ, environment, clear=False), patch.object(
+            app,
+            "forward_gemini_api",
+            return_value=(200, b'{"candidates":[]}', "application/json"),
+        ) as forward:
+            app.get_config.cache_clear()
+            app.get_gemini_config.cache_clear()
+            unauthorized_status, _ = call_app("POST", path, body=body)
+            status, response = call_app(
+                "POST", path, body=body, google_api_key="test-gemini-key-two"
+            )
+            unapproved_status, _ = call_app(
+                "POST",
+                "/gemini/v1beta/models/unapproved-model:generateContent",
+                body=body,
+                google_api_key="test-gemini-key-two",
+            )
+
+        self.assertEqual(unauthorized_status, "401 Unauthorized")
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(response, b'{"candidates":[]}')
+        self.assertEqual(unapproved_status, "404 Not Found")
+        forward.assert_called_once()
+        self.assertEqual(forward.call_args.kwargs["api_key"], "test-gemini-key-two")
+
+    def test_wsgi_gemini_relay_is_disabled_by_default(self) -> None:
+        environment = {
+            "UPSTREAM_WEBHOOK_URL": self.config.upstream_url,
+            "TELEGRAM_WEBHOOK_SECRET": self.config.webhook_secret,
+            "GEMINI_RELAY_ENABLED": "false",
+        }
+        with patch.dict(os.environ, environment, clear=False):
+            app.get_config.cache_clear()
+            app.get_gemini_config.cache_clear()
+            status, _ = call_app(
+                "POST",
+                "/gemini/v1beta/models/gemini-3.5-flash-lite:generateContent",
+                body=b"{}",
+                google_api_key="test-gemini-key-one",
+            )
+        self.assertEqual(status, "404 Not Found")
+
     def test_wsgi_outbound_proxy_requires_secret_and_allows_known_method(self) -> None:
         environment = {
             "UPSTREAM_WEBHOOK_URL": self.config.upstream_url,
@@ -366,6 +481,14 @@ def setup_environment(config: app.RelayConfig) -> dict[str, str]:
     }
 
 
+def gemini_config() -> app.GeminiRelayConfig:
+    return app.GeminiRelayConfig(
+        enabled=True,
+        api_keys=("test-gemini-key-one", "test-gemini-key-two"),
+        allowed_models=("gemini-3.5-flash-lite",),
+    )
+
+
 def call_app(
     method: str,
     path: str,
@@ -374,6 +497,7 @@ def call_app(
     secret: str = "",
     relay_secret: str = "",
     relay_auth: str = "",
+    google_api_key: str = "",
     authorization: str = "",
 ):
     captured = {}
@@ -394,6 +518,8 @@ def call_app(
         environ["HTTP_X_AGENTFA_RELAY_SECRET"] = relay_secret
     if relay_auth:
         environ["HTTP_X_AGENTFA_RELAY_AUTH"] = relay_auth
+    if google_api_key:
+        environ["HTTP_X_GOOG_API_KEY"] = google_api_key
     if authorization:
         environ["HTTP_AUTHORIZATION"] = authorization
     response_body = b"".join(app.application(environ, start_response))
