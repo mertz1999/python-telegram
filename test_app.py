@@ -36,7 +36,6 @@ class RelayTests(unittest.TestCase):
     def tearDown(self) -> None:
         app.get_config.cache_clear()
         app.get_setup_config.cache_clear()
-        app.get_gemini_config.cache_clear()
 
     def test_config_rejects_non_https_upstream(self) -> None:
         with self.assertRaisesRegex(ValueError, "HTTPS"):
@@ -214,33 +213,20 @@ class RelayTests(unittest.TestCase):
         self.assertTrue(captured["request"].full_url.endswith("/sendMessage"))
         self.assertEqual(captured["kwargs"]["timeout"], 15)
 
-    def test_gemini_relay_requires_keys_when_enabled(self) -> None:
-        with self.assertRaisesRegex(ValueError, "GEMINI_RELAY_API_KEYS"):
-            app.GeminiRelayConfig(
-                enabled=True,
-                api_keys=(),
-                allowed_models=("gemini-3.5-flash-lite",),
-            ).validate()
-
-    def test_gemini_path_is_limited_to_allowlisted_generate_content(self) -> None:
-        config = gemini_config()
+    def test_gemini_path_is_limited_to_generate_content(self) -> None:
         self.assertEqual(
             app.parse_gemini_path(
-                "/gemini/v1beta/models/gemini-3.5-flash-lite:generateContent",
-                config,
+                "/gemini/v1beta/models/gemini-3.5-flash-lite:generateContent"
             ),
             ("v1beta", "gemini-3.5-flash-lite", "generateContent"),
         )
-        self.assertIsNone(
-            app.parse_gemini_path(
-                "/gemini/v1beta/models/unapproved-model:generateContent",
-                config,
-            )
+        self.assertEqual(
+            app.parse_gemini_path("/gemini/v1beta/models/another-model:generateContent"),
+            ("v1beta", "another-model", "generateContent"),
         )
         self.assertIsNone(
             app.parse_gemini_path(
-                "/gemini/v1beta/models/gemini-3.5-flash-lite:deleteModel",
-                config,
+                "/gemini/v1beta/models/gemini-3.5-flash-lite:deleteModel"
             )
         )
 
@@ -259,7 +245,6 @@ class RelayTests(unittest.TestCase):
             action="generateContent",
             raw_body=body,
             api_key="test-gemini-key-one",
-            config=gemini_config(),
             opener=opener,
         )
 
@@ -276,13 +261,11 @@ class RelayTests(unittest.TestCase):
         self.assertEqual(request.get_header("X-goog-api-key"), "test-gemini-key-one")
         self.assertEqual(captured["kwargs"]["timeout"], 125.0)
 
-    def test_wsgi_gemini_relay_requires_allowlisted_key_and_model(self) -> None:
+    def test_wsgi_gemini_relay_requires_agentfa_auth_and_forwards_api_key(self) -> None:
         environment = {
             "UPSTREAM_WEBHOOK_URL": self.config.upstream_url,
             "TELEGRAM_WEBHOOK_SECRET": self.config.webhook_secret,
-            "GEMINI_RELAY_ENABLED": "true",
-            "GEMINI_RELAY_API_KEYS": '["test-gemini-key-one","test-gemini-key-two"]',
-            "GEMINI_ALLOWED_MODELS": "gemini-3.5-flash-lite",
+            "TELEGRAM_BOT_TOKEN": self.config.bot_token,
         }
         path = "/gemini/v1beta/models/gemini-3.5-flash-lite:generateContent"
         body = b'{"contents":[{"parts":[{"text":"hello"}]}]}'
@@ -292,41 +275,37 @@ class RelayTests(unittest.TestCase):
             return_value=(200, b'{"candidates":[]}', "application/json"),
         ) as forward:
             app.get_config.cache_clear()
-            app.get_gemini_config.cache_clear()
-            unauthorized_status, _ = call_app("POST", path, body=body)
-            status, response = call_app(
+            unauthenticated_status, _ = call_app(
                 "POST", path, body=body, google_api_key="test-gemini-key-two"
             )
-            unapproved_status, _ = call_app(
+            missing_key_status, _ = call_app(
                 "POST",
-                "/gemini/v1beta/models/unapproved-model:generateContent",
+                path,
                 body=body,
+                relay_auth=app.derive_relay_auth(self.config.bot_token),
+            )
+            status, response = call_app(
+                "POST",
+                path,
+                body=body,
+                relay_auth=app.derive_relay_auth(self.config.bot_token),
+                google_api_key="test-gemini-key-two",
+            )
+            unsupported_status, _ = call_app(
+                "POST",
+                "/gemini/v1beta/models/gemini-3.5-flash-lite:deleteModel",
+                body=body,
+                relay_auth=app.derive_relay_auth(self.config.bot_token),
                 google_api_key="test-gemini-key-two",
             )
 
-        self.assertEqual(unauthorized_status, "401 Unauthorized")
+        self.assertEqual(unauthenticated_status, "401 Unauthorized")
+        self.assertEqual(missing_key_status, "400 Bad Request")
         self.assertEqual(status, "200 OK")
         self.assertEqual(response, b'{"candidates":[]}')
-        self.assertEqual(unapproved_status, "404 Not Found")
+        self.assertEqual(unsupported_status, "404 Not Found")
         forward.assert_called_once()
         self.assertEqual(forward.call_args.kwargs["api_key"], "test-gemini-key-two")
-
-    def test_wsgi_gemini_relay_is_disabled_by_default(self) -> None:
-        environment = {
-            "UPSTREAM_WEBHOOK_URL": self.config.upstream_url,
-            "TELEGRAM_WEBHOOK_SECRET": self.config.webhook_secret,
-            "GEMINI_RELAY_ENABLED": "false",
-        }
-        with patch.dict(os.environ, environment, clear=False):
-            app.get_config.cache_clear()
-            app.get_gemini_config.cache_clear()
-            status, _ = call_app(
-                "POST",
-                "/gemini/v1beta/models/gemini-3.5-flash-lite:generateContent",
-                body=b"{}",
-                google_api_key="test-gemini-key-one",
-            )
-        self.assertEqual(status, "404 Not Found")
 
     def test_wsgi_outbound_proxy_requires_secret_and_allows_known_method(self) -> None:
         environment = {
@@ -479,14 +458,6 @@ def setup_environment(config: app.RelayConfig) -> dict[str, str]:
         "TELEGRAM_BOT_TOKEN": "123456:telegram-token-value",
         "RELAY_PUBLIC_URL": "https://relay.example.com",
     }
-
-
-def gemini_config() -> app.GeminiRelayConfig:
-    return app.GeminiRelayConfig(
-        enabled=True,
-        api_keys=("test-gemini-key-one", "test-gemini-key-two"),
-        allowed_models=("gemini-3.5-flash-lite",),
-    )
 
 
 def call_app(

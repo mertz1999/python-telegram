@@ -39,9 +39,9 @@ OUTBOUND_METHODS = {
 DEFAULT_MAX_BODY_BYTES = 1_048_576
 GEMINI_PATH_PREFIX = "/gemini/"
 GEMINI_UPSTREAM_ORIGIN = "https://generativelanguage.googleapis.com"
-DEFAULT_GEMINI_MAX_BODY_BYTES = 20_971_520
-DEFAULT_GEMINI_MAX_RESPONSE_BYTES = 10_485_760
-DEFAULT_GEMINI_MODELS = ("gemini-3.5-flash-lite",)
+GEMINI_MAX_BODY_BYTES = 20_971_520
+GEMINI_MAX_RESPONSE_BYTES = 10_485_760
+GEMINI_FORWARD_TIMEOUT_SECONDS = 125.0
 _GEMINI_PATH_RE = re.compile(
     r"^/gemini/(?P<version>v1(?:beta)?)/models/"
     r"(?P<model>[A-Za-z0-9._-]+):(?P<action>generateContent)$"
@@ -159,56 +159,6 @@ class WebhookSetupConfig:
             raise ConfigurationError("RELAY_PUBLIC_URL must be a complete HTTPS origin")
 
 
-@dataclass(frozen=True)
-class GeminiRelayConfig:
-    enabled: bool
-    api_keys: tuple[str, ...]
-    allowed_models: tuple[str, ...]
-    forward_timeout_seconds: float = 125.0
-    max_body_bytes: int = DEFAULT_GEMINI_MAX_BODY_BYTES
-    max_response_bytes: int = DEFAULT_GEMINI_MAX_RESPONSE_BYTES
-
-    @classmethod
-    def from_env(cls) -> "GeminiRelayConfig":
-        config = cls(
-            enabled=_env_bool("GEMINI_RELAY_ENABLED", False),
-            api_keys=_secret_list_env("GEMINI_RELAY_API_KEYS"),
-            allowed_models=_csv_env("GEMINI_ALLOWED_MODELS", DEFAULT_GEMINI_MODELS),
-            forward_timeout_seconds=_env_float(
-                "GEMINI_FORWARD_TIMEOUT_SECONDS", 125.0, minimum=1.0, maximum=300.0
-            ),
-            max_body_bytes=_env_int(
-                "GEMINI_MAX_BODY_BYTES",
-                DEFAULT_GEMINI_MAX_BODY_BYTES,
-                minimum=1024,
-                maximum=52_428_800,
-            ),
-            max_response_bytes=_env_int(
-                "GEMINI_MAX_RESPONSE_BYTES",
-                DEFAULT_GEMINI_MAX_RESPONSE_BYTES,
-                minimum=1024,
-                maximum=52_428_800,
-            ),
-        )
-        config.validate()
-        return config
-
-    def validate(self) -> None:
-        if not self.enabled:
-            return
-        if not self.api_keys:
-            raise ConfigurationError(
-                "GEMINI_RELAY_API_KEYS must contain at least one key when Gemini relay is enabled"
-            )
-        if not self.allowed_models:
-            raise ConfigurationError(
-                "GEMINI_ALLOWED_MODELS must contain at least one model when Gemini relay is enabled"
-            )
-        for model in self.allowed_models:
-            if not re.fullmatch(r"[A-Za-z0-9._-]+", model):
-                raise ConfigurationError("GEMINI_ALLOWED_MODELS contains an invalid model name")
-
-
 def _env_int(name: str, default: int, *, minimum: int, maximum: int) -> int:
     raw = os.environ.get(name, str(default))
     try:
@@ -240,28 +190,6 @@ def _env_bool(name: str, default: bool) -> bool:
     raise ConfigurationError(f"{name} must be true or false")
 
 
-def _csv_env(name: str, default: tuple[str, ...] = ()) -> tuple[str, ...]:
-    raw = os.environ.get(name, "").strip()
-    if not raw:
-        return default
-    return tuple(dict.fromkeys(item.strip() for item in raw.split(",") if item.strip()))
-
-
-def _secret_list_env(name: str) -> tuple[str, ...]:
-    raw = os.environ.get(name, "").strip()
-    if not raw:
-        return ()
-    if raw.startswith("["):
-        try:
-            parsed = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise ConfigurationError(f"{name} must be a JSON array or comma-separated list") from exc
-        if not isinstance(parsed, list) or not all(isinstance(item, str) for item in parsed):
-            raise ConfigurationError(f"{name} must be a JSON array of strings")
-        return tuple(dict.fromkeys(item.strip() for item in parsed if item.strip()))
-    return _csv_env(name)
-
-
 @lru_cache(maxsize=1)
 def get_config() -> RelayConfig:
     return RelayConfig.from_env()
@@ -270,11 +198,6 @@ def get_config() -> RelayConfig:
 @lru_cache(maxsize=1)
 def get_setup_config() -> WebhookSetupConfig:
     return WebhookSetupConfig.from_env()
-
-
-@lru_cache(maxsize=1)
-def get_gemini_config() -> GeminiRelayConfig:
-    return GeminiRelayConfig.from_env()
 
 
 def parse_update(raw_body: bytes) -> dict[str, Any]:
@@ -466,14 +389,11 @@ def forward_telegram_api(
     return status, payload
 
 
-def parse_gemini_path(path: str, config: GeminiRelayConfig) -> tuple[str, str, str] | None:
+def parse_gemini_path(path: str) -> tuple[str, str, str] | None:
     match = _GEMINI_PATH_RE.fullmatch(path)
     if match is None:
         return None
-    model = match.group("model")
-    if model not in config.allowed_models:
-        return None
-    return match.group("version"), model, match.group("action")
+    return match.group("version"), match.group("model"), match.group("action")
 
 
 def forward_gemini_api(
@@ -483,10 +403,9 @@ def forward_gemini_api(
     action: str,
     raw_body: bytes,
     api_key: str,
-    config: GeminiRelayConfig,
     opener: Callable[..., Any] | None = None,
 ) -> tuple[int, bytes, str]:
-    """Forward one allowlisted Gemini request to Google's fixed HTTPS origin."""
+    """Transparently forward one authenticated request to Google's fixed origin."""
     request = Request(
         f"{GEMINI_UPSTREAM_ORIGIN}/{version}/models/{model}:{action}",
         data=raw_body,
@@ -502,9 +421,9 @@ def forward_gemini_api(
         HTTPSHandler(context=ssl.create_default_context()), NoRedirectHandler()
     ).open
     try:
-        with open_request(request, timeout=config.forward_timeout_seconds) as response:
+        with open_request(request, timeout=GEMINI_FORWARD_TIMEOUT_SECONDS) as response:
             status = int(response.status)
-            response_body = response.read(config.max_response_bytes + 1)
+            response_body = response.read(GEMINI_MAX_RESPONSE_BYTES + 1)
             response_headers = getattr(response, "headers", None)
             content_type = (
                 response_headers.get_content_type()
@@ -513,7 +432,7 @@ def forward_gemini_api(
             )
     except HTTPError as exc:
         status = int(exc.code)
-        response_body = exc.read(config.max_response_bytes + 1)
+        response_body = exc.read(GEMINI_MAX_RESPONSE_BYTES + 1)
         content_type = (
             exc.headers.get_content_type()
             if exc.headers and hasattr(exc.headers, "get_content_type")
@@ -532,7 +451,7 @@ def forward_gemini_api(
                 status=HTTPStatus.GATEWAY_TIMEOUT,
             ) from exc
         raise GeminiAPIError("Gemini could not be reached") from exc
-    if len(response_body) > config.max_response_bytes:
+    if len(response_body) > GEMINI_MAX_RESPONSE_BYTES:
         raise GeminiAPIError("Gemini response exceeded the configured size limit")
     return status, response_body, content_type
 
@@ -644,24 +563,24 @@ def application(environ: dict[str, Any], start_response: Callable[..., Any]) -> 
     if path.startswith(GEMINI_PATH_PREFIX):
         if method != "POST":
             return json_response(start_response, HTTPStatus.NOT_FOUND, {"ok": False})
-        try:
-            gemini_config = get_gemini_config()
-        except ConfigurationError as exc:
-            LOGGER.error("Invalid Gemini relay configuration: %s", exc)
-            return json_response(start_response, HTTPStatus.SERVICE_UNAVAILABLE, {"ok": False})
-        if not gemini_config.enabled:
-            return json_response(start_response, HTTPStatus.NOT_FOUND, {"ok": False})
-        parsed_path = parse_gemini_path(path, gemini_config)
+        parsed_path = parse_gemini_path(path)
         if parsed_path is None:
             return json_response(start_response, HTTPStatus.NOT_FOUND, {"ok": False})
-        supplied_api_key = environ.get("HTTP_X_GOOG_API_KEY", "")
-        if not any(secrets_match(supplied_api_key, key) for key in gemini_config.api_keys):
+        supplied_secret = environ.get("HTTP_X_AGENTFA_RELAY_SECRET", "")
+        supplied_relay_auth = environ.get("HTTP_X_AGENTFA_RELAY_AUTH", "")
+        if not (
+            secrets_match(supplied_secret, config.webhook_secret)
+            or secrets_match(supplied_relay_auth, derive_relay_auth(config.bot_token))
+        ):
             return json_response(start_response, HTTPStatus.UNAUTHORIZED, {"ok": False})
+        supplied_api_key = environ.get("HTTP_X_GOOG_API_KEY", "")
+        if not supplied_api_key:
+            return json_response(start_response, HTTPStatus.BAD_REQUEST, {"ok": False})
         try:
             content_length = int(environ.get("CONTENT_LENGTH", ""))
         except (TypeError, ValueError):
             return json_response(start_response, HTTPStatus.LENGTH_REQUIRED, {"ok": False})
-        if content_length <= 0 or content_length > gemini_config.max_body_bytes:
+        if content_length <= 0 or content_length > GEMINI_MAX_BODY_BYTES:
             return json_response(
                 start_response, HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"ok": False}
             )
@@ -684,7 +603,6 @@ def application(environ: dict[str, Any], start_response: Callable[..., Any]) -> 
                 action=action,
                 raw_body=raw_body,
                 api_key=supplied_api_key,
-                config=gemini_config,
             )
         except GeminiAPIError as exc:
             LOGGER.warning("Gemini relay failed for model=%s: %s", model, exc)
@@ -836,16 +754,7 @@ if __name__ == "__main__":
         config = get_config()
     except ConfigurationError as exc:
         raise SystemExit(f"Invalid configuration: {exc}") from exc
-    try:
-        gemini_config = get_gemini_config()
-    except ConfigurationError as exc:
-        raise SystemExit(f"Invalid Gemini relay configuration: {exc}") from exc
     LOGGER.info("Starting relay for upstream_host=%s", urlsplit(config.upstream_url).hostname)
-    if gemini_config.enabled:
-        LOGGER.info(
-            "Gemini relay enabled for %s allowlisted model(s)",
-            len(gemini_config.allowed_models),
-        )
     port = _env_int("PORT", 8080, minimum=1, maximum=65535)
     StandaloneApplication(
         application,
