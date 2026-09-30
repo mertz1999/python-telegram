@@ -29,6 +29,15 @@ AgentFA
   -> https://generativelanguage.googleapis.com/v1beta/models/<allowed-model>:generateContent
 ```
 
+It also transparently relays AgentFA's Serper searches when the PaaSta network
+cannot reach Google Cloud directly:
+
+```text
+AgentFA
+  -> https://your-relay-domain.example/search
+  -> https://google.serper.dev/search
+```
+
 It is intentionally not a general-purpose proxy. Each upstream is fixed,
 redirects are rejected, request bodies are size-limited, the Gemini operation
 is restricted to `generateContent`, and message bodies, prompts, and secrets
@@ -117,6 +126,24 @@ AgentFA's key rotation, cooldown handling, usage accounting, and key labels.
 
 Only enable this route on a host and for usage that complies with Google's
 Gemini API terms and regional availability requirements.
+
+## Serper relay
+
+The `/search` route requires no Serper-specific relay configuration. AgentFA
+keeps `SERPER_API_KEY` and sends it in the standard `X-API-KEY` request header;
+the relay forwards that header and the JSON body to Serper's fixed `/search`
+endpoint without storing or logging either value. No other Serper path or
+arbitrary upstream URL is accepted.
+
+After deployment, point AgentFA's existing search proxy setting to the relay
+origin:
+
+```env
+SEARCH_PROXY_BASE=https://your-relay-domain.example
+```
+
+Keep `SERPER_API_KEY` only in AgentFA's environment. Do not add it to the relay
+environment.
 
 ### Protected HTTP setup endpoint
 

@@ -307,6 +307,66 @@ class RelayTests(unittest.TestCase):
         forward.assert_called_once()
         self.assertEqual(forward.call_args.kwargs["api_key"], "test-gemini-key-two")
 
+    def test_forward_serper_search_uses_fixed_origin_and_preserves_request(self) -> None:
+        body = b'{"q":"running shoes","gl":"ir","hl":"fa"}'
+        captured = {}
+
+        def opener(request, **kwargs):
+            captured["request"] = request
+            captured["kwargs"] = kwargs
+            return FakeResponse(body=b'{"organic":[]}')
+
+        status, response, content_type = app.forward_serper_search(
+            raw_body=body,
+            api_key="test-serper-key",
+            opener=opener,
+        )
+
+        request = captured["request"]
+        self.assertEqual(status, 200)
+        self.assertEqual(response, b'{"organic":[]}')
+        self.assertEqual(content_type, "application/json")
+        self.assertEqual(request.full_url, "https://google.serper.dev/search")
+        self.assertEqual(request.data, body)
+        self.assertEqual(request.get_header("X-api-key"), "test-serper-key")
+        self.assertEqual(captured["kwargs"]["timeout"], 35.0)
+
+    def test_wsgi_serper_relay_requires_key_and_forwards_transparently(self) -> None:
+        environment = {
+            "UPSTREAM_WEBHOOK_URL": self.config.upstream_url,
+            "TELEGRAM_WEBHOOK_SECRET": self.config.webhook_secret,
+        }
+        body = b'{"q":"running shoes","gl":"ir","hl":"fa"}'
+        with patch.dict(os.environ, environment, clear=False), patch.object(
+            app,
+            "forward_serper_search",
+            return_value=(200, b'{"organic":[]}', "application/json"),
+        ) as forward:
+            app.get_config.cache_clear()
+            missing_key_status, _ = call_app("POST", "/search", body=body)
+            status, response = call_app(
+                "POST",
+                "/search",
+                body=body,
+                serper_api_key="test-serper-key",
+            )
+            wrong_method_status, _ = call_app(
+                "GET", "/search", serper_api_key="test-serper-key"
+            )
+            unsupported_path_status, _ = call_app(
+                "POST",
+                "/search/anything-else",
+                body=body,
+                serper_api_key="test-serper-key",
+            )
+
+        self.assertEqual(missing_key_status, "400 Bad Request")
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(response, b'{"organic":[]}')
+        self.assertEqual(wrong_method_status, "404 Not Found")
+        self.assertEqual(unsupported_path_status, "404 Not Found")
+        forward.assert_called_once_with(raw_body=body, api_key="test-serper-key")
+
     def test_wsgi_outbound_proxy_requires_secret_and_allows_known_method(self) -> None:
         environment = {
             "UPSTREAM_WEBHOOK_URL": self.config.upstream_url,
@@ -469,6 +529,7 @@ def call_app(
     relay_secret: str = "",
     relay_auth: str = "",
     google_api_key: str = "",
+    serper_api_key: str = "",
     authorization: str = "",
 ):
     captured = {}
@@ -491,6 +552,8 @@ def call_app(
         environ["HTTP_X_AGENTFA_RELAY_AUTH"] = relay_auth
     if google_api_key:
         environ["HTTP_X_GOOG_API_KEY"] = google_api_key
+    if serper_api_key:
+        environ["HTTP_X_API_KEY"] = serper_api_key
     if authorization:
         environ["HTTP_AUTHORIZATION"] = authorization
     response_body = b"".join(app.application(environ, start_response))

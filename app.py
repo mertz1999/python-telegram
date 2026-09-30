@@ -46,6 +46,11 @@ _GEMINI_PATH_RE = re.compile(
     r"^/gemini/(?P<version>v1(?:beta)?)/models/"
     r"(?P<model>[A-Za-z0-9._-]+):(?P<action>generateContent)$"
 )
+SERPER_RELAY_PATH = "/search"
+SERPER_UPSTREAM_URL = "https://google.serper.dev/search"
+SERPER_MAX_BODY_BYTES = 262_144
+SERPER_MAX_RESPONSE_BYTES = 2_097_152
+SERPER_FORWARD_TIMEOUT_SECONDS = 35.0
 
 
 class ConfigurationError(ValueError):
@@ -70,6 +75,14 @@ class TelegramAPIError(RuntimeError):
 
 class GeminiAPIError(RuntimeError):
     """Raised when the relay cannot safely complete a Gemini request."""
+
+    def __init__(self, message: str, *, status: int = HTTPStatus.BAD_GATEWAY) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+class SerperAPIError(RuntimeError):
+    """Raised when the relay cannot safely complete a Serper request."""
 
     def __init__(self, message: str, *, status: int = HTTPStatus.BAD_GATEWAY) -> None:
         super().__init__(message)
@@ -456,6 +469,63 @@ def forward_gemini_api(
     return status, response_body, content_type
 
 
+def forward_serper_search(
+    *,
+    raw_body: bytes,
+    api_key: str,
+    opener: Callable[..., Any] | None = None,
+) -> tuple[int, bytes, str]:
+    """Forward one Serper search while keeping its credentials in AgentFA."""
+    request = Request(
+        SERPER_UPSTREAM_URL,
+        data=raw_body,
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "X-API-KEY": api_key,
+            "User-Agent": "AgentFA-Serper-Relay/1.0",
+        },
+    )
+    open_request = opener or build_opener(
+        HTTPSHandler(context=ssl.create_default_context()), NoRedirectHandler()
+    ).open
+    try:
+        with open_request(request, timeout=SERPER_FORWARD_TIMEOUT_SECONDS) as response:
+            status = int(response.status)
+            response_body = response.read(SERPER_MAX_RESPONSE_BYTES + 1)
+            response_headers = getattr(response, "headers", None)
+            content_type = (
+                response_headers.get_content_type()
+                if response_headers and hasattr(response_headers, "get_content_type")
+                else "application/json"
+            )
+    except HTTPError as exc:
+        status = int(exc.code)
+        response_body = exc.read(SERPER_MAX_RESPONSE_BYTES + 1)
+        content_type = (
+            exc.headers.get_content_type()
+            if exc.headers and hasattr(exc.headers, "get_content_type")
+            else "application/json"
+        )
+    except (TimeoutError, socket.timeout) as exc:
+        raise SerperAPIError(
+            "Serper did not respond before the forwarding deadline",
+            status=HTTPStatus.GATEWAY_TIMEOUT,
+        ) from exc
+    except (URLError, OSError) as exc:
+        reason = exc.reason if isinstance(exc, URLError) else exc
+        if isinstance(reason, (TimeoutError, socket.timeout)):
+            raise SerperAPIError(
+                "Serper did not respond before the forwarding deadline",
+                status=HTTPStatus.GATEWAY_TIMEOUT,
+            ) from exc
+        raise SerperAPIError("Serper could not be reached") from exc
+    if len(response_body) > SERPER_MAX_RESPONSE_BYTES:
+        raise SerperAPIError("Serper response exceeded the configured size limit")
+    return status, response_body, content_type
+
+
 def check_agentfa_connection(config: RelayConfig) -> dict[str, Any]:
     update_id = 2_000_000_000 + (int(time.time()) % 100_000_000)
     raw_body = json.dumps({"update_id": update_id}, separators=(",", ":")).encode()
@@ -560,6 +630,46 @@ def application(environ: dict[str, Any], start_response: Callable[..., Any]) -> 
 
     if method == "GET" and path == "/healthz":
         return json_response(start_response, HTTPStatus.OK, {"ok": True})
+    if path == SERPER_RELAY_PATH:
+        if method != "POST":
+            return json_response(start_response, HTTPStatus.NOT_FOUND, {"ok": False})
+        supplied_api_key = environ.get("HTTP_X_API_KEY", "")
+        if not supplied_api_key:
+            return json_response(start_response, HTTPStatus.BAD_REQUEST, {"ok": False})
+        try:
+            content_length = int(environ.get("CONTENT_LENGTH", ""))
+        except (TypeError, ValueError):
+            return json_response(start_response, HTTPStatus.LENGTH_REQUIRED, {"ok": False})
+        if content_length <= 0 or content_length > SERPER_MAX_BODY_BYTES:
+            return json_response(
+                start_response, HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"ok": False}
+            )
+        raw_body = environ["wsgi.input"].read(content_length)
+        try:
+            payload = json.loads(raw_body)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return json_response(
+                start_response, HTTPStatus.UNPROCESSABLE_ENTITY, {"ok": False}
+            )
+        if not isinstance(payload, dict):
+            return json_response(
+                start_response, HTTPStatus.UNPROCESSABLE_ENTITY, {"ok": False}
+            )
+        try:
+            status, response_body, content_type = forward_serper_search(
+                raw_body=raw_body,
+                api_key=supplied_api_key,
+            )
+        except SerperAPIError as exc:
+            LOGGER.warning("Serper relay failed: %s", exc)
+            return json_response(start_response, exc.status, {"ok": False})
+        LOGGER.info("Serper relay completed status=%s", status)
+        return raw_response(
+            start_response,
+            status,
+            response_body,
+            content_type=content_type,
+        )
     if path.startswith(GEMINI_PATH_PREFIX):
         if method != "POST":
             return json_response(start_response, HTTPStatus.NOT_FOUND, {"ok": False})
